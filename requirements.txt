@@ -1,0 +1,6 @@
+numpy>=1.26
+pandas>=2.0
+scikit-learn>=1.4
+yfinance>=0.2.40
+baostock>=0.9.4
+torch>=2.2
