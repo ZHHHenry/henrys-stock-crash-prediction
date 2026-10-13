@@ -4,3 +4,5 @@ scikit-learn>=1.4
 yfinance>=0.2.40
 baostock>=0.9.4
 torch>=2.2
+matplotlib>=3.8
+lightgbm>=4.3

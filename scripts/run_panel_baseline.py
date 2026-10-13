@@ -23,7 +23,8 @@ from tsmodels.labels import (
     dimson_residuals,
     horizon_label,
 )
-from tsmodels.models import LSTMBaseline
+from tsmodels import panel as panel_io
+from tsmodels.models import GRUBaseline, LSTMBaseline, TCNBaseline
 from tsmodels.train import (
     compute_metrics,
     fit_pooled_scaler,
@@ -31,6 +32,8 @@ from tsmodels.train import (
     train_model,
     transform_frame,
 )
+
+MODEL_REGISTRY = {"lstm": LSTMBaseline, "gru": GRUBaseline, "tcn": TCNBaseline}
 
 
 def parse_args():
@@ -53,11 +56,12 @@ def parse_args():
     parser.add_argument("--horizon-weeks", type=int, default=4)
     parser.add_argument("--label-a-horizon", type=int, default=5)
     parser.add_argument("--label-a-threshold", type=float, default=-0.08)
-    parser.add_argument("--model", default="lstm")
+    parser.add_argument("--model", default="lstm", choices=sorted(MODEL_REGISTRY), help="模型类型（lstm/gru/tcn）")
     parser.add_argument("--gen", default="gen2")
     parser.add_argument("--hidden-dim", type=int, default=64)
     parser.add_argument("--num-layers", type=int, default=2)
     parser.add_argument("--epochs", type=int, default=15)
+    parser.add_argument("--labels", default="labelA5d,labelB4w", help="要训练/评估的标签，逗号分隔（用于断点续跑）")
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--train-ratio", type=float, default=0.8)
@@ -66,6 +70,7 @@ def parse_args():
     parser.add_argument("--embargo-weeks", type=int, default=6)
     parser.add_argument("--threshold", type=float, default=0.5)
     parser.add_argument("--pos-weight", action="store_true", help="用负正样本比加权正类")
+    parser.add_argument("--eval-only", action="store_true", help="仅载入已保存权重做推理并保存预测分数，不训练、不改写指标")
     parser.add_argument("--seed", type=int, default=42)
     return parser.parse_args()
 
@@ -238,16 +243,13 @@ def main():
         return
 
     n = len(panel)
-    if args.split_date:
-        split_date = pd.Timestamp(args.split_date)
-    else:
-        k = int(n * args.train_ratio)
-        split_date = panel.loc[k, "date"]
-    purge_delta = pd.Timedelta(weeks=args.embargo_weeks)
-    train_mask = (panel["date"] < split_date - purge_delta).to_numpy()
-    test_mask = (panel["date"] >= split_date).to_numpy()
-    if args.train_start:
-        train_mask = train_mask & (panel["date"] >= pd.Timestamp(args.train_start)).to_numpy()
+    split_date, train_mask, test_mask = panel_io.time_split(
+        panel,
+        split_date=args.split_date or None,
+        train_ratio=args.train_ratio,
+        embargo_weeks=args.embargo_weeks,
+        train_start=args.train_start or None,
+    )
     if int(test_mask.sum()) < 50 or int(train_mask.sum()) < 200:
         raise RuntimeError(f"切分后样本不足：train {int(train_mask.sum())}，test {int(test_mask.sum())}")
 
@@ -280,33 +282,35 @@ def main():
         f"test {panel.loc[test_mask, 'date'].min().date()} ~ {panel.loc[test_mask, 'date'].max().date()}"
     )
 
-    xs = np.zeros((n, args.seq_len, len(FEATURE_COLS)), dtype=np.float32)
-    for i, row in panel.iterrows():
-        frame = feats_scaled[row["ticker"]]
-        pos = frame.index.searchsorted(row["date"], side="right") - 1
-        xs[i] = frame[FEATURE_COLS].values[pos - args.seq_len + 1 : pos + 1]
+    xs = panel_io.build_windows(panel, feats_scaled, FEATURE_COLS, args.seq_len)
     X = torch.tensor(xs, dtype=torch.float32)
     train_idx = np.where(train_mask)[0]
     test_idx = np.where(test_mask)[0]
     test_years = pd.DatetimeIndex(panel.loc[test_mask, "date"]).year.to_numpy()
 
     tag = "_pw" if args.pos_weight else ""
-    for label_name in ("labelA5d", "labelB4w"):
+    for label_name in [s.strip() for s in args.labels.split(",") if s.strip()]:
         y = torch.tensor(panel[label_name].values.astype(np.float32))
         train_loader = DataLoader(TensorDataset(X[train_idx], y[train_idx]), batch_size=args.batch_size, shuffle=True)
         test_loader = DataLoader(TensorDataset(X[test_idx], y[test_idx]), batch_size=args.batch_size, shuffle=False)
 
         y_train = panel[label_name].values[train_idx]
         train_pos_rate = float(y_train.mean())
-        pos_weight = None
-        if args.pos_weight and 0 < train_pos_rate < 1:
-            ratio = float((1 - train_pos_rate) / train_pos_rate)
-            pos_weight = torch.tensor([ratio], device=device)
-            print(f"[{label_name}] pos_weight = {ratio:.2f}")
+        model = MODEL_REGISTRY[args.model](len(FEATURE_COLS), args.hidden_dim, args.num_layers).to(device)
+        weights_path = out_dir / f"{args.model}_{label_name}_panel{tag}.pt"
 
-        model = LSTMBaseline(len(FEATURE_COLS), args.hidden_dim, args.num_layers).to(device)
-        history = train_model(model, train_loader, args.epochs, args.lr, device, pos_weight)
-        print(f"[{label_name}] loss: " + ", ".join(f"{value:.4f}" for value in history))
+        if args.eval_only:
+            model.load_state_dict(torch.load(weights_path, map_location=device))
+            history = None
+            print(f"[{label_name}] eval-only：载入 {weights_path.name}，跳过训练")
+        else:
+            pos_weight = None
+            if args.pos_weight and 0 < train_pos_rate < 1:
+                ratio = float((1 - train_pos_rate) / train_pos_rate)
+                pos_weight = torch.tensor([ratio], device=device)
+                print(f"[{label_name}] pos_weight = {ratio:.2f}")
+            history = train_model(model, train_loader, args.epochs, args.lr, device, pos_weight)
+            print(f"[{label_name}] loss: " + ", ".join(f"{value:.4f}" for value in history))
 
         y_true, y_prob = predict_proba(model, test_loader, device)
         metrics = compute_metrics(y_true, y_prob, args.threshold)
@@ -319,10 +323,20 @@ def main():
         metrics["by_year"] = by_year
         print(f"[{label_name}] test 指标: {json.dumps(metrics, ensure_ascii=False)}")
 
-        torch.save(model.state_dict(), out_dir / f"{args.model}_{label_name}_panel{tag}.pt")
-        report = {"args": vars(args), "loss_history": history, "metrics": metrics}
-        with open(out_dir / f"metrics_{label_name}_panel{tag}.json", "w", encoding="utf-8") as f:
-            json.dump(report, f, ensure_ascii=False, indent=2)
+        panel_io.save_scores(out_dir, f"scores_{label_name}_panel{tag}", y_true, y_prob, years=test_years)
+        if args.eval_only:
+            metrics_path = out_dir / f"metrics_{label_name}_panel{tag}.json"
+            if metrics_path.exists():
+                stored = json.loads(metrics_path.read_text(encoding="utf-8"))["metrics"]
+                print(
+                    f"[{label_name}] 与已存指标对照：roc {stored.get('roc_auc')} -> {metrics['roc_auc']} | "
+                    f"pr {stored.get('pr_auc')} -> {metrics['pr_auc']}"
+                )
+        else:
+            torch.save(model.state_dict(), weights_path)
+            report = {"args": vars(args), "loss_history": history, "metrics": metrics}
+            with open(out_dir / f"metrics_{label_name}_panel{tag}.json", "w", encoding="utf-8") as f:
+                json.dump(report, f, ensure_ascii=False, indent=2)
 
     print(f"[save] 模型与指标已保存到 outputs/models/{args.model}/{args.gen}/")
 
